@@ -1,0 +1,14 @@
+asgiref==3.11.1
+Django==6.0.2
+django-cors-headers==4.9.0
+django-filter==25.2
+django-phonenumber-field==8.4.0
+djangorestframework==3.16.1
+djangorestframework-simplejwt==5.5.1
+dotenv==0.9.9
+Markdown==3.10.1
+phonenumbers==9.0.23
+PyJWT==2.11.0
+python-dotenv==1.2.1
+sqlparse==0.5.5
+gunicorn==23.0.0

@@ -30,7 +30,7 @@ class Cliente(models.Model):
     primera_parte_ip = models.PositiveSmallIntegerField(choices=rango)
     segunda_parte_ip = models.PositiveSmallIntegerField(choices=numero)
     ip_completa = models.CharField(max_length=15, unique=True)
-    id_privada = models.ForeignKey(Privada,models.CASCADE,null=True,blank=True)
+    id_privada = models.ForeignKey(Privada,models.DO_NOTHING,null=True,blank=True)
     recibo_pdf = models.FileField(null=True,blank=True)
     def __str__(self):
         return self.nombre
@@ -88,18 +88,7 @@ class Pagos(models.Model):
     def __str__(self):
        return self.id_cliente
     
-class antenasPerdidas(models.Model):
-        
-        
-        nombre = models.CharField(max_length=200)
-        direccion = models.CharField(max_length=200)
-        telefono = models.CharField(max_length=400)
-        ip = models.CharField(max_length=30)
-        recuperable = models.CharField(max_length=100)
-        
-        
-        
-        
+    
 
 
 

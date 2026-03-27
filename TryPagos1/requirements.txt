@@ -12,5 +12,3 @@ PyJWT==2.11.0
 python-dotenv==1.2.1
 sqlparse==0.5.5
 gunicorn==23.0.0
-requests==2.31.0
-librouteros==3.4.1

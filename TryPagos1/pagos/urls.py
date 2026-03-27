@@ -8,13 +8,6 @@ urlpatterns = [
     path("cortesRegister/",views.CortesView.as_view(),name="cortesRegister"),
     path("ips-disponibles/",views.IpsAvaibleView.as_view(),name='ips-disponibles' ),
     path("activarServicio/",views.ActivarServicio.as_view(),name='activarServicio' ),
-    path("antenaData/<int:pk>/",views.AntenaView.as_view(),name='antenaData'),
-    path("antenaReboot/<int:pk>/",views.RebootAntenaView.as_view(),name="rebootAntena"),
-    path("sectorReboot/<int:pk>/",views.RebootSectorView.as_view(),name="rebootAntena"),
-    path("sectorData/<int:pk>/",views.SectorView.as_view(),name='sectorData'),
+
     path("cortarServicio/",views.CortarServicio.as_view(),name='cortarServicio' ),
-    path("antenaMikrotikData/<int:pk>/",views.MikrotikStatusView.as_view(),name='antenaMikrotikData'),
-    path("lastPayment/<int:pk>/",views.LastPayment.as_view(),name='ultimoPago'),
-    path("editInfoAntena/<int:pk>/",views.EditAntenaView.as_view(),name="EditarAntena"),
-    
 ]

@@ -1,5 +1,5 @@
 from django.shortcuts import render,get_object_or_404
-from .models import Cliente,Pagos
+from .models import Cliente,Pagos,antenasPerdidas
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -11,6 +11,20 @@ from django.utils import timezone
 from django.utils.dateparse import parse_date
 from datetime import datetime, timedelta
 import ipaddress
+import re
+import requests
+import socket
+import urllib3
+from requests.auth import HTTPBasicAuth
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+from urllib.parse import urljoin
+import json
+from typing import Any, Dict, List, Tuple, Union
+from librouteros import connect
+from librouteros.exceptions import LibRouterosError
+
 # Create your views here.
 
 
@@ -130,6 +144,7 @@ class CortesView(ListAPIView):
                 "pago_id": p.id,
                 "cliente_id": c.id if c else None,
                 "cliente_nombre": getattr(c, "nombre", None),  # ajusta si tu campo se llama diferente
+                 "cliente_direccion":getattr(c,"direccion",None),
                 "ultimo_pago": p.ultimo_pago,                 # DateField -> DRF lo serializa a "YYYY-MM-DD"
                 "ultimo_pago_p": p.ultimo_pago_p,
                 "id_user": p.id_user_id,                       # quién registró el último movimiento
@@ -269,3 +284,869 @@ class IpsAvaibleView(ListAPIView):
             status=status.HTTP_200_OK
         )
 
+
+
+
+def _to_number_if_possible(v: str):
+    v = v.strip()
+    # quita comillas
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        v = v[1:-1]
+
+    # bool
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+
+    # int
+    if re.fullmatch(r"-?\d+", v):
+        try:
+            return int(v)
+        except:
+            return v
+
+    # float
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        try:
+            return float(v)
+        except:
+            return v
+
+    return v
+
+
+def parse_airos_status_text(text: str) -> Dict[str, Any]:
+    """
+    Convierte el status.cgi “tipo texto” de airOS (como el que pegaste)
+    en un diccionario anidado.
+    """
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # ignora basura típica si aparece
+        if line.startswith("<!--") or line.startswith("<!DOCTYPE"):
+            continue
+        lines.append(line)
+
+    # La estructura viene como pares: key en una línea, valor en otra.
+    # Cuando la “siguiente” línea no parece valor, se interpreta como sub-sección.
+    root: Dict[str, Any] = {}
+    stack: List[Tuple[int, Dict[str, Any]]] = [(0, root)]  # (indent_level, current_dict)
+
+    def current_dict() -> Dict[str, Any]:
+        return stack[-1][1]
+
+    i = 0
+    while i < len(lines):
+        key = lines[i]
+        # mira si hay "valor" inmediatamente después
+        nxt = lines[i + 1] if i + 1 < len(lines) else None
+
+        # Heurística: si la siguiente línea parece valor (tiene comillas, número, true/false, o contiene espacios tipo "2352 MHz")
+        def looks_like_value(s: str) -> bool:
+            if s is None:
+                return False
+            if s.startswith('"') or s.startswith("'"):
+                return True
+            if re.fullmatch(r"-?\d+(\.\d+)?", s):
+                return True
+            if s.lower() in ("true", "false"):
+                return True
+            # cosas tipo: 2352 MHz, v6.1.7, NanoStation loco M2
+            if any(ch.isdigit() for ch in s) and " " in s:
+                return True
+            # MAC
+            if re.fullmatch(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", s):
+                return True
+            # tokens con puntos/guiones
+            if re.fullmatch(r"[A-Za-z0-9._:-]+", s):
+                return True
+            return False
+
+        if nxt is not None and looks_like_value(nxt):
+            # set key:value
+            current_dict()[key] = _to_number_if_possible(nxt)
+            i += 2
+            continue
+
+        # Si no hay valor, interpretamos como sección (dict) y seguimos
+        # A veces hay índices tipo "0", "1" dentro de "interfaces" → lo tratamos como subsección dict también
+        new_section: Dict[str, Any] = {}
+        current_dict()[key] = new_section
+        stack.append((len(stack), new_section))
+        i += 1
+
+        # Truco: si la próxima línea parece “otra sección al mismo nivel” y no llenamos nada,
+        # el parser se autoacomoda por la secuencia natural. (Funciona bien con tu formato.)
+        # Para evitar stack infinito, si detectamos que la sección quedó vacía y la siguiente no es par,
+        # iremos cerrando más abajo cuando aparezcan pares.
+
+        # Limpieza del stack: si la sección anterior no recibe nada y aparece una clave “superior”,
+        # esto es difícil sin indent real. Lo dejamos simple y robusto:
+        # cerramos secciones vacías cuando detectamos repetición de claves top-level comunes.
+        # (Opcional: lo podemos mejorar si tu salida real trae tabs/indent.)
+        # Por ahora, no cerramos aquí.
+
+    return root
+
+
+def extract_eth0(status: Dict[str, Any]) -> Dict[str, Any]:
+    interfaces = status.get("interfaces")
+
+    # Caso dict: {"0": {...}, "1": {...}}
+    if isinstance(interfaces, dict):
+        for _, iface in interfaces.items():
+            if isinstance(iface, dict) and iface.get("ifname") == "eth0":
+                return iface
+
+    # Caso list: [{...}, {...}]
+    if isinstance(interfaces, list):
+        for iface in interfaces:
+            if isinstance(iface, dict) and iface.get("ifname") == "eth0":
+                return iface
+
+    return {}
+
+
+def normalize_airos(status: Dict[str, Any]) -> Dict[str, Any]:
+    w = status.get("wireless", {}) if isinstance(status.get("wireless"), dict) else {}
+    p = w.get("polling", {}) if isinstance(w.get("polling"), dict) else {}
+
+    eth0 = extract_eth0(status)
+    eth0_status = eth0.get("status", {}) if isinstance(eth0.get("status"), dict) else {}
+
+    totalram = status.get("totalram")
+    freeram = status.get("freeram")
+
+    def pct_free_ram():
+        try:
+            return round((float(freeram) / float(totalram)) * 100, 1)
+        except Exception:
+            return None
+
+    return {
+        "device": {
+            "hostname": status.get("hostname"),
+            "devmodel": status.get("devmodel"),
+            "fwversion": status.get("fwversion"),
+            "fwprefix": status.get("fwprefix"),
+            "netrole": status.get("netrole"),
+            "time": status.get("time"),
+            "uptime": status.get("uptime"),
+        },
+        "system": {
+            "cpuload": status.get("cpuload"),
+            "totalram": totalram,
+            "freeram": freeram,
+            "free_ram_pct": pct_free_ram(),
+        },
+        "wireless": {
+            "mode": w.get("mode"),
+            "essid": w.get("essid"),
+            "apmac": w.get("apmac"),
+            "frequency": w.get("frequency"),
+            "opmode": w.get("opmode"),
+            "security": w.get("security"),
+            "antenna": w.get("antenna"),
+            "chains": w.get("chains"),
+        },
+        "link": {
+            "signal_dbm": w.get("signal"),
+            "noise_dbm": w.get("noisef"),
+            "txpower_dbm": w.get("txpower"),
+            "distance_m": w.get("distance"),
+            "ccq": w.get("ccq"),
+            "txrate_mbps": w.get("txrate"),
+            "rxrate_mbps": w.get("rxrate"),
+            "quality_pct": p.get("quality"),
+            "capacity_pct": p.get("capacity"),
+        },
+        "interfaces": {
+            "eth0": {
+                "ifname": eth0.get("ifname"),
+                "enabled": eth0.get("enabled"),
+                "plugged": eth0_status.get("plugged"),
+                "speed": eth0_status.get("speed"),
+                "duplex": eth0_status.get("duplex"),
+            }
+        }
+    }
+
+def _is_login_html(text: str) -> bool:
+    t = (text or "").lower()
+    return ("inicio de sesi" in t) or ("login.cgi" in t) or ("<title>inicio" in t) or ("<form" in t and "password" in t)
+
+def fetch_airos_status_https_with_session(ip: str, user: str, password: str) -> str:
+    """
+    1) Abre login.cgi para setear cookies
+    2) Postea credenciales
+    3) Descarga status.cgi ya autenticado (misma sesión)
+    """
+    s = make_relaxed_https_session()  # tu session con TLSRelaxAdapter (SECLEVEL=1)
+
+    base = f"https://{ip}"
+
+    # 1) warm up / cookies
+    s.get(f"{base}/login.cgi", timeout=(3, 6), verify=False, allow_redirects=True)
+
+    # 2) login (probamos 2 payloads comunes en airOS)
+    payloads = [
+        {"username": user, "password": password},
+        {"user": user, "password": password},  # algunos firmwares usan "user"
+    ]
+
+    logged_in = False
+    last_preview = ""
+    for data in payloads:
+        resp = s.post(
+            f"{base}/login.cgi",
+            data=data,
+            timeout=(3, 6),
+            verify=False,
+            allow_redirects=True,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+        last_preview = (resp.text or "")[:300]
+        # Si NO es HTML de login, o si ya nos dejó cookie, lo consideramos login ok
+        if not _is_login_html(resp.text):
+            logged_in = True
+            break
+
+        # A veces el login responde HTML igual, pero ya dejó cookie; entonces probamos status.cgi
+        test = s.get(f"{base}/status.cgi", timeout=(3, 6), verify=False, allow_redirects=True)
+        if not _is_login_html(test.text) and test.status_code == 200:
+            logged_in = True
+            return test.text
+
+    if not logged_in:
+        # Debug útil
+        return f"__LOGIN_FAILED_HTML__\n{last_preview}"
+
+    # 3) status.cgi autenticado
+    r = s.get(
+        f"{base}/status.cgi",
+        timeout=(3, 6),
+        verify=False,
+        allow_redirects=True,
+        headers={"Accept": "text/plain, application/json, */*"},
+    )
+    r.raise_for_status()
+    return r.text
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class TLSRelaxAdapter(HTTPAdapter):
+    """
+    Adapter para conectarse a equipos legacy (airOS viejo).
+    Baja SECLEVEL para permitir DH pequeño y habilita compatibilidad legacy.
+    """
+    def __init__(self, **kwargs):
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
+
+        # ✅ Este es el punto clave para DH_KEY_TOO_SMALL
+        # (baja el nivel de seguridad)
+        self.ssl_context.set_ciphers("DEFAULT@SECLEVEL=1")
+
+        # ✅ Compatibilidad extra con servidores legacy (OpenSSL 3)
+        if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+            self.ssl_context.options |= ssl.OP_LEGACY_SERVER_CONNECT
+
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["ssl_context"] = self.ssl_context
+        self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs)
+
+
+def make_relaxed_https_session() -> requests.Session:
+    s = requests.Session()
+    s.mount("https://", TLSRelaxAdapter())
+    return s
+
+
+def _try_airOS_status_https(ip: str, user: str, password: str) -> dict:
+    url = f"https://{ip}/status.cgi"
+    print("Consultando URL (HTTPS):", url)
+
+    try:
+        raw_text = fetch_airos_status_https_with_session(ip, user, password)
+
+        # Si el helper devolvió un marcador de falla
+        if raw_text.startswith("__LOGIN_FAILED_HTML__"):
+            return {
+                "ok": False,
+                "stage": "login_failed",
+                "message": "No se pudo iniciar sesión (sigue devolviendo HTML de login).",
+                "raw_preview": raw_text.split("\n", 1)[-1][:400].replace("\n", "\\n"),
+            }
+
+        # Si todavía llega login, reporta
+        if _is_login_html(raw_text):
+            return {
+                "ok": False,
+                "stage": "unexpected_html",
+                "message": "Aún devuelve HTML de login (sesión no válida).",
+                "raw_preview": raw_text[:400].replace("\n", "\\n"),
+            }
+
+        parsed = parse_airos_smart(raw_text)      # usa el parser “smart” si lo tienes
+        normalized = normalize_airos(parsed)
+
+        return {"ok": True, "transport": "https", "source": "status.cgi", "normalized": normalized}
+
+    except requests.exceptions.SSLError as e:
+        return {"ok": False, "stage": "ssl", "message": f"SSL error: {e}"}
+    except Exception as e:
+        return {"ok": False, "stage": "unknown", "message": f"Error: {e}"}
+
+
+
+
+
+class AntenaView(RetrieveAPIView):
+    permission_classes = [IsAuthenticated]
+    queryset = Cliente.objects.all()
+
+    def get(self, request, pk):
+        usuario = "ubnt"
+        password = "ubnt2"
+
+        cliente = Cliente.objects.filter(id=pk).first()
+        if not cliente:
+            return Response({"detail": "Cliente no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+
+        ip = (cliente.ip_completa or "").strip()
+        if not ip:
+            return Response({"detail": "Cliente sin ip_completa"}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = _try_airOS_status_https(ip, usuario, password)
+
+        return Response(
+            {"cliente_id": cliente.id, "ip": ip, "antena": data},
+            status=status.HTTP_200_OK
+        )
+
+
+def _clean_value(v: str):
+    v = v.strip()
+
+    # Quitar comillas
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        v = v[1:-1]
+
+    # Booleanos
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+
+    # Enteros
+    if re.fullmatch(r"-?\d+", v):
+        try:
+            return int(v)
+        except:
+            return v
+
+    # Flotantes
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        try:
+            return float(v)
+        except:
+            return v
+
+    return v
+
+
+def parse_airos_smart(raw_text: str) -> Dict[str, Any]:
+    """
+    Parser flexible para status.cgi de airOS.
+    Detecta JSON, JS embebido o texto tipo clave/valor.
+    """
+
+    if not raw_text:
+        return {}
+
+    text = raw_text.strip()
+
+    # =====================================================
+    # 1️⃣ Intentar JSON directo
+    # =====================================================
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # =====================================================
+    # 2️⃣ Intentar extraer JSON dentro de JS
+    #    Ej: var status = {...};
+    # =====================================================
+    js_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if js_match:
+        candidate = js_match.group(0)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # =====================================================
+    # 3️⃣ Parse formato texto clásico airOS
+    # =====================================================
+    lines = [line.rstrip("\r") for line in raw_text.splitlines() if line.strip()]
+    root: Dict[str, Any] = {}
+    stack = [(0, root)]  # (indent_level, current_dict)
+
+    def indent_level(s: str) -> int:
+        level = 0
+        for ch in s:
+            if ch == "\t":
+                level += 4
+            elif ch == " ":
+                level += 1
+            else:
+                break
+        return level
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        ind = indent_level(line)
+        stripped = line.strip()
+
+        # Ajustar stack según indentación
+        while stack and ind < stack[-1][0]:
+            stack.pop()
+
+        current_dict = stack[-1][1]
+
+        # Caso key\tvalue
+        if "\t" in stripped:
+            parts = [p for p in stripped.split("\t") if p != ""]
+            if len(parts) >= 2:
+                key = parts[0].strip()
+                value = "\t".join(parts[1:]).strip()
+                current_dict[key] = _clean_value(value)
+                i += 1
+                continue
+
+        # Caso clave en una línea y valor en la siguiente
+        if i + 1 < len(lines):
+            next_line = lines[i + 1]
+            next_stripped = next_line.strip()
+
+            looks_like_value = (
+                next_stripped.startswith(("'", '"')) or
+                re.fullmatch(r"-?\d+(\.\d+)?", next_stripped) or
+                next_stripped.lower() in ("true", "false") or
+                re.fullmatch(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", next_stripped)
+            )
+
+            if looks_like_value:
+                current_dict[stripped] = _clean_value(next_stripped)
+                i += 2
+                continue
+
+            # Si siguiente línea tiene más indentación → subsección
+            if indent_level(next_line) > ind:
+                new_dict = {}
+                current_dict[stripped] = new_dict
+                stack.append((indent_level(next_line), new_dict))
+                i += 1
+                continue
+
+        # Si nada coincide, lo guardamos como sección vacía
+        current_dict[stripped] = {}
+        stack.append((ind + 1, current_dict[stripped]))
+        i += 1
+
+    return root
+
+
+def _parse_reboot_form(html: str):
+    """
+    Extrae action del <form> y los inputs hidden {name: value}.
+    """
+    # action del primer form
+    m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    action = m.group(1) if m else "/reboot.cgi"
+
+    # inputs hidden
+    hidden = {}
+    for name, value in re.findall(
+        r'<input[^>]+type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+        html,
+        flags=re.IGNORECASE,
+    ):
+        hidden[name] = value
+
+    # algunos firmwares traen hidden sin value explícito
+    for name in re.findall(
+        r'<input[^>]+type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\']',
+        html,
+        flags=re.IGNORECASE,
+    ):
+        hidden.setdefault(name, "")
+
+    return action, hidden
+class RebootAntenaView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        usuario = "ubnt"
+        password = "ubnt2"
+
+        cliente = Cliente.objects.filter(id=pk).first()
+        if not cliente:
+            return Response({"ok": False, "detail": "Cliente no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+
+        ip = (cliente.ip_completa or "").strip()
+        if not ip:
+            return Response({"ok": False, "detail": "Cliente sin ip_completa"}, status=status.HTTP_400_BAD_REQUEST)
+
+        result = reboot_via_https_confirm(ip, usuario, password)
+
+        # Si falla, igual regreso 200 con ok:false para que el front lo maneje fácil
+        return Response(
+            {"cliente_id": cliente.id, "ip": ip, "reboot": result},
+            status=status.HTTP_200_OK
+        )
+        
+def login_airos_session(ip: str, user: str, password: str) -> requests.Session:
+    """
+    Devuelve una sesión autenticada lista para usar (cookies + TLS relax).
+    """
+    base = f"https://{ip}"
+    s = make_relaxed_https_session()
+
+    # Warm-up cookies
+    s.get(f"{base}/login.cgi", timeout=(3, 6), verify=False, allow_redirects=True)
+
+    # Intento login
+    payloads = [
+        {"username": user, "password": password},
+        {"user": user, "password": password},
+    ]
+
+    for data in payloads:
+        resp = s.post(
+            f"{base}/login.cgi",
+            data=data,
+            timeout=(3, 6),
+            verify=False,
+            allow_redirects=True,
+        )
+
+        if not _is_login_html(resp.text):
+            return s
+
+        # probar acceso a status
+        test = s.get(f"{base}/status.cgi", timeout=(3, 6), verify=False)
+        if test.status_code == 200 and not _is_login_html(test.text):
+            return s
+
+    raise Exception("No se pudo iniciar sesión en la antena")
+def reboot_via_https_confirm(ip: str, user: str, password: str) -> dict:
+    base = f"https://{ip}"
+
+    try:
+        s = login_airos_session(ip, user, password)
+
+        # 1️⃣ Abrir reboot.cgi
+        r1 = s.get(f"{base}/reboot.cgi", timeout=(3, 6), verify=False)
+
+        if r1.status_code != 200:
+            return {"ok": False, "stage": "open_reboot", "status_code": r1.status_code}
+
+        html = r1.text or ""
+
+        if _is_login_html(html):
+            return {"ok": False, "stage": "auth_lost"}
+
+        action, hidden = _parse_reboot_form(html)
+        post_url = urljoin(f"{base}/", action)
+
+        payload = dict(hidden)
+        payload.setdefault("reboot", "1")
+        payload.setdefault("action", "reboot")
+        payload.setdefault("do_reboot", "1")
+        payload.setdefault("confirm", "1")
+
+        # 2️⃣ Confirmar reboot
+        r2 = s.post(
+            post_url,
+            data=payload,
+            timeout=(3, 6),
+            verify=False,
+        )
+
+        # Si responde 200/302 y luego se cae, es correcto
+        if r2.status_code in (200, 302, 204):
+            return {
+                "ok": True,
+                "stage": "reboot_sent",
+                "status_code": r2.status_code,
+            }
+
+        return {
+            "ok": False,
+            "stage": "unexpected_status",
+            "status_code": r2.status_code,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "stage": "error",
+            "message": str(e),
+        }
+class RebootSectorView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        usuario = "ubnt"
+        password = "ubnt2"
+
+
+
+        ip = (f"192.168.1.{pk}").strip()
+        if not ip:
+            return Response({"ok": False, "detail": "Cliente sin ip_completa"}, status=status.HTTP_400_BAD_REQUEST)
+
+        result = reboot_via_https_confirm(ip, usuario, password)
+
+        # Si falla, igual regreso 200 con ok:false para que el front lo maneje fácil
+        return Response(
+            { "ip": ip, "reboot": result},
+            status=status.HTTP_200_OK
+        )
+        
+class SectorView(RetrieveAPIView):
+    permission_classes = [IsAuthenticated]
+    queryset = Cliente.objects.all()
+
+    def get(self, request, pk):
+        usuario = "ubnt"
+        password = "ubnt2"
+
+ 
+
+        ip = (f"192.168.1.{pk}").strip()
+        print(ip)
+        if not ip:
+            return Response({"detail": "Cliente sin ip_completa"}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = _try_airOS_status_https(ip, usuario, password)
+
+        return Response(
+            { "ip": ip, "antena": data},
+            status=status.HTTP_200_OK
+        )
+
+
+def _tcp_check(ip: str, port: int, timeout: float = 2.5) -> dict:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return {"ok": True, "port": port}
+    except Exception as e:
+        return {"ok": False, "port": port, "error": str(e)}
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+def mt_connect(ip: str, user: str, password: str, port: int = 8728, timeout: int = 5):
+    """
+    Conecta a MikroTik RouterOS API (v6) y devuelve la conexión.
+    """
+    return connect(
+        host=ip,
+        username=user,
+        password=password,
+        port=port,
+        timeout=timeout,
+    )
+def mt_status(ip: str, user: str, password: str) -> dict:
+    # “ping real” al API
+    tcp = _tcp_check(ip, 8728)
+    if not tcp["ok"]:
+        return {"ok": False, "stage": "tcp_check", "message": "No abre API 8728", "tcp": tcp}
+
+    try:
+        api = mt_connect(ip, user, password)
+
+        # Identity
+        ident = next(iter(api.path("/system/identity").select()), None)  # {'name': '...'}
+        identity = ident.get("name") if isinstance(ident, dict) else None
+
+        # Resource
+        res = next(iter(api.path("/system/resource").select()), None)
+        # RouterOS v6 suele traer keys: version, board-name, platform, uptime, cpu-load, free-memory, total-memory...
+        version = res.get("version") if isinstance(res, dict) else None
+        board = res.get("board-name") if isinstance(res, dict) else None
+        uptime = res.get("uptime") if isinstance(res, dict) else None
+        cpu_load = res.get("cpu-load") if isinstance(res, dict) else None
+        free_mem = res.get("free-memory") if isinstance(res, dict) else None
+        total_mem = res.get("total-memory") if isinstance(res, dict) else None
+
+        free_pct = None
+        try:
+            if free_mem is not None and total_mem:
+                free_pct = round((float(free_mem) / float(total_mem)) * 100, 1)
+        except Exception:
+            pass
+
+        # Interfaces: buscamos ether1 por nombre (SXT Lite normalmente trae ether1)
+        ether1 = None
+        for it in api.path("/interface").select():
+            if isinstance(it, dict) and it.get("name") == "ether1":
+                ether1 = it
+                break
+
+        # running/disabled suelen venir como 'true'/'false' strings
+        def to_bool(v):
+            if isinstance(v, bool): return v
+            if isinstance(v, str): return v.lower() == "true"
+            return None
+
+        eth = {
+            "name": ether1.get("name") if ether1 else "ether1",
+            "running": to_bool(ether1.get("running")) if ether1 else None,
+            "disabled": to_bool(ether1.get("disabled")) if ether1 else None,
+            "type": ether1.get("type") if ether1 else None,
+            "mtu": ether1.get("mtu") if ether1 else None,
+        }
+
+        # Wireless (SXT Lite usual: wlan1)
+        wlan = None
+        for w in api.path("/interface/wireless").select():
+            if isinstance(w, dict) and w.get("name") == "wlan1":
+                wlan = w
+                break
+
+        wireless = {
+            "name": wlan.get("name") if wlan else "wlan1",
+            "mode": wlan.get("mode") if wlan else None,
+            "ssid": wlan.get("ssid") if wlan else None,
+            "band": wlan.get("band") if wlan else None,
+            "frequency": wlan.get("frequency") if wlan else None,
+            "tx_power": wlan.get("tx-power") if wlan else None,
+            "disabled": to_bool(wlan.get("disabled")) if wlan else None,
+        }
+
+        # Monitor wireless (da señal, tx/rx, etc). En v6: /interface/wireless/monitor numbers=wlan1 once
+        link = {}
+        try:
+            mon = list(api.path("/interface/wireless/monitor").call(numbers="wlan1", once=""))  # devuelve lista de dicts
+            mon0 = mon[0] if mon else {}
+            # keys típicas: signal-strength, tx-rate, rx-rate, noise-floor, snr, ccq, etc (varía)
+            link = {
+                "signal_dbm": mon0.get("signal-strength"),
+                "noise_dbm": mon0.get("noise-floor"),
+                "snr_db": mon0.get("snr"),
+                "tx_rate": mon0.get("tx-rate"),
+                "rx_rate": mon0.get("rx-rate"),
+                "ccq": mon0.get("ccq"),
+            }
+        except Exception:
+            # no pasa nada si no soporta/permiso
+            link = {}
+
+        return {
+            "ok": True,
+            "transport": "routeros_api",
+            "normalized": {
+                "device": {
+                    "identity": identity,
+                    "board": board,
+                    "version": version,
+                    "uptime": uptime,
+                },
+                "system": {
+                    "cpu_load": cpu_load,
+                    "free_memory": free_mem,
+                    "total_memory": total_mem,
+                    "free_ram_pct": free_pct,
+                },
+                "interfaces": {
+                    "ether1": eth
+                },
+                "wireless": wireless,
+                "link": link,
+            }
+        }
+
+    except LibRouterosError as e:
+        return {"ok": False, "stage": "api_error", "message": str(e)}
+    except Exception as e:
+        return {"ok": False, "stage": "unknown", "message": str(e)}
+    
+
+
+class MikrotikStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        user = "admin"
+        password = "ubnt2"
+
+        cliente = Cliente.objects.filter(id=pk).first()
+        if not cliente:
+            print("no esta Jhon")
+            return Response({"detail": "Cliente no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+
+        ip = (cliente.ip_completa or "").strip()
+        if not ip:
+            return Response({"detail": "Cliente sin ip_completa"}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = mt_status(ip, user, password)
+        return Response({"cliente_id": cliente.id, "ip": ip, "mikrotik": data}, status=status.HTTP_200_OK)
+
+
+
+class LastPayment(APIView):
+    
+    permission_classes=[IsAuthenticated]
+    
+    def get(self, request,pk):
+        
+        pagos = Pagos.objects.get(id_cliente = pk)
+        
+        if not pagos:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        else :
+            lastPayment = pagos.ultimo_pago
+            data={
+                "ultimo_pago":lastPayment
+            }
+            return Response(status=status.HTTP_200_OK,data=data)
+        
+class DestroyCliente(DestroyAPIView):
+    
+    permission_classes = [IsAuthenticated]
+    queryset=Cliente.objects.all()
+    
+    def destroy(self, request, *args, **kwargs,):
+        print("apunta Aqui")
+        
+        return super().destroy(request, *args, **kwargs)
+
+class EditAntenaView(UpdateAPIView):
+    permission_classes = [IsAuthenticated]
+    queryset = Cliente.objects.all()
+    serializer_class = ClienteSerializer  # asegúrate de tenerlo importado
+
+    def patch(self, request, pk, *args, **kwargs):
+        cliente = get_object_or_404(Cliente, id=pk)
+        serializer = self.get_serializer(cliente, data=request.data, partial=True)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+            

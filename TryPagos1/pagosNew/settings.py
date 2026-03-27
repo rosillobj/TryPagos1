@@ -63,7 +63,6 @@ INSTALLED_APPS = [
     'corsheaders',
     'pagos',
     'login',
-    'borrego',
     
 ]
 

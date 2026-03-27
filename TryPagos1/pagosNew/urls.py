@@ -13,5 +13,4 @@ urlpatterns = [
     path("login-auth/", include("rest_framework.urls")),
     path('loginRegister/',views.UserRegister.as_view(),name='loginRegister'),
     path('pagos/',include("pagos.urls")),
-    path("borrego/",include("borrego.urls")),
 ]

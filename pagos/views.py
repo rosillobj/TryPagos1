@@ -1,5 +1,5 @@
 from django.shortcuts import render,get_object_or_404
-from .models import Cliente,Pagos,antenasPerdidas
+from .models import Cliente,Pagos
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -24,7 +24,6 @@ import json
 from typing import Any, Dict, List, Tuple, Union
 from librouteros import connect
 from librouteros.exceptions import LibRouterosError
-
 # Create your views here.
 
 
@@ -128,7 +127,7 @@ class CortesView(ListAPIView):
 
     def get(self, request, *args, **kwargs):
         today = timezone.localdate()
-        limite = today - timedelta(days=30)
+        limite = today - timedelta(days=40)
 
         cortes_qs = (
             Pagos.objects
@@ -1129,9 +1128,8 @@ class DestroyCliente(DestroyAPIView):
     permission_classes = [IsAuthenticated]
     queryset=Cliente.objects.all()
     
-    def destroy(self, request, *args, **kwargs,):
-        print("apunta Aqui")
-        
+    def destroy(self, request, *args, **kwargs):
+        print("apunta Aqui ")
         return super().destroy(request, *args, **kwargs)
 
 class EditAntenaView(UpdateAPIView):

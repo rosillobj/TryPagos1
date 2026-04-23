@@ -55,6 +55,13 @@ class PagosListView(APIView):
 
 
 
+from django.utils import timezone
+from django.utils.dateparse import parse_date
+from rest_framework.generics import UpdateAPIView
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+
 MONTHS = {
     1: "january", 2: "february", 3: "march", 4: "april",
     5: "may", 6: "june", 7: "july", 8: "august",
@@ -67,8 +74,8 @@ class PagoNuevoListView(UpdateAPIView):
 
     def patch(self, request, *args, **kwargs):
         cliente_id = request.data.get("id")
-        pago_raw   = request.data.get("pago")
-        fecha_raw  = request.data.get("fecha")  # "2026-02-09"
+        pago_raw = request.data.get("pago")
+        fecha_raw = request.data.get("fecha")  # "2026-02-09"
 
         if not cliente_id or pago_raw is None or not fecha_raw:
             return Response(
@@ -76,51 +83,70 @@ class PagoNuevoListView(UpdateAPIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # pago
         try:
             pago = int(pago_raw)
             if pago < 0:
-                return Response({"detail": "El pago no puede ser negativo."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"detail": "El pago no puede ser negativo."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
         except (TypeError, ValueError):
-            return Response({"detail": "El campo 'pago' debe ser un entero."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "El campo 'pago' debe ser un entero."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        # fecha "YYYY-MM-DD"
         fecha_pago = parse_date(str(fecha_raw))
         if not fecha_pago:
-            return Response({"detail": "Fecha inválida. Usa YYYY-MM-DD."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Fecha inválida. Usa YYYY-MM-DD."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        # buscar pagos del cliente
+        mesFront = MONTHS[fecha_pago.month]
+
         try:
             pagos = Pagos.objects.get(id_cliente_id=cliente_id)
         except Pagos.DoesNotExist:
-            return Response({"detail": "No existe registro de pagos para ese cliente."},
-                            status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "No existe registro de pagos para ese cliente."},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
-        # mes seguro (no depende del idioma del servidor)
-        mes_nombre = MONTHS[timezone.now().month]   # ej: "february"
-        mes_p = f"{mes_nombre}_p"                   # ej: "february_p"
-        mes_d = mes_nombre                          # ej: "february"
+        # por defecto usa el mes actual
+        mes_nombre = MONTHS[timezone.now().month]
+        mes_p = f"{mes_nombre}_p"
+        mes_d = mes_nombre
 
-        total_anterior = getattr(pagos, mes_p) or 0
+        print("mes actual:", mes_nombre)
+        print("mes front:", mesFront)
+
+        # solo si es diferente, usar el mes enviado por el front
+        if mes_nombre != mesFront:
+            mes_p = f"{mesFront}_p"
+            mes_d = mesFront
+
+        total_anterior = getattr(pagos, mes_p, 0) or 0
         total_nuevo = total_anterior + pago
 
         setattr(pagos, mes_p, total_nuevo)
         setattr(pagos, mes_d, fecha_pago)
 
         pagos.ultimo_pago = fecha_pago
-        pagos.ultimo_pago_p = total_nuevo
+        pagos.ultimo_pago_p = pago
         pagos.id_user = request.user
 
         pagos.save(update_fields=[mes_p, mes_d, "ultimo_pago", "ultimo_pago_p", "id_user"])
 
         return Response(
-            {"mes": mes_nombre, "total_mes": total_nuevo, "fecha": str(fecha_pago)},
+            {
+                "mes": mes_d,
+                "campo_monto": mes_p,
+                "total_mes": total_nuevo,
+                "fecha": str(fecha_pago)
+            },
             status=status.HTTP_200_OK
         )
-
 class CortesView(ListAPIView):
     permission_classes = [IsAuthenticated]
     queryset = Pagos.objects.all()

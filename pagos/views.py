@@ -55,12 +55,7 @@ class PagosListView(APIView):
 
 
 
-from django.utils import timezone
-from django.utils.dateparse import parse_date
-from rest_framework.generics import UpdateAPIView
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from rest_framework import status
+
 
 MONTHS = {
     1: "january", 2: "february", 3: "march", 4: "april",
@@ -106,12 +101,23 @@ class PagoNuevoListView(UpdateAPIView):
         mesFront = MONTHS[fecha_pago.month]
 
         try:
-            pagos = Pagos.objects.get(id_cliente_id=cliente_id)
+           pagos = Pagos.objects.get(id_cliente_id=cliente_id)
         except Pagos.DoesNotExist:
-            return Response(
-                {"detail": "No existe registro de pagos para ese cliente."},
-                status=status.HTTP_404_NOT_FOUND
-            )
+           return Response(
+        {"detail": "No existe registro de pagos para ese cliente."},
+        status=status.HTTP_404_NOT_FOUND
+    )
+
+# Validar que la fecha enviada no sea menor al último pago registrado
+        if pagos.ultimo_pago and fecha_pago < pagos.ultimo_pago:
+          return Response(
+        {
+            "detail": "La fecha enviada no puede ser menor al último pago registrado.",
+            "ultimo_pago_actual": str(pagos.ultimo_pago),
+            "fecha_enviada": str(fecha_pago),
+        },
+        status=status.HTTP_400_BAD_REQUEST
+    )
 
         # por defecto usa el mes actual
         mes_nombre = MONTHS[timezone.now().month]

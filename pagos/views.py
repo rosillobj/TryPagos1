@@ -1179,4 +1179,121 @@ class EditAntenaView(UpdateAPIView):
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-            
+
+def is_invalid_tx(station):
+    tx = station.get("tx")
+
+    if tx in (None, "", "-"):
+        return True
+
+    try:
+        return float(tx) < 1
+    except (TypeError, ValueError):
+        return True
+def should_reboot_by_tx(stations, threshold=0.80):
+    total = len(stations)
+
+    if total == 0:
+        return False, {
+            "total": 0,
+            "invalid_tx": 0,
+            "invalid_percent": 0,
+            "reason": "sin estaciones asociadas"
+        }
+
+    invalid_count = sum(1 for s in stations if is_invalid_tx(s))
+    invalid_percent = invalid_count / total
+
+    return invalid_percent >= threshold, {
+        "total": total,
+        "invalid_tx": invalid_count,
+        "invalid_percent": round(invalid_percent * 100, 2),
+    }
+class SectorTxHealthView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        usuario = "ubnt"
+        password = "ubnt2"
+        ip = f"192.168.1.{pk}"
+
+        try:
+            s = login_airos_session(ip, usuario, password)
+
+            r = s.get(
+                f"https://{ip}/sta.cgi",
+                timeout=(3, 8),
+                verify=False,
+                headers={"Accept": "application/json, text/plain, */*"},
+            )
+
+            if r.status_code != 200:
+                return Response({
+                    "ok": False,
+                    "ip": ip,
+                    "stage": "sta_request",
+                    "status_code": r.status_code,
+                    "detail": "No se pudo consultar sta.cgi",
+                }, status=status.HTTP_200_OK)
+
+            try:
+                stations = r.json()
+            except Exception:
+                return Response({
+                    "ok": False,
+                    "ip": ip,
+                    "stage": "json_parse",
+                    "detail": "sta.cgi no devolvió JSON válido",
+                    "preview": r.text[:300],
+                }, status=status.HTTP_200_OK)
+
+            def is_invalid_tx(station):
+                tx = station.get("tx")
+
+                if tx in (None, "", "-"):
+                    return True
+
+                try:
+                    return float(tx) < 1
+                except (TypeError, ValueError):
+                    return True
+
+            total = len(stations)
+            invalid_stations = []
+
+            for station in stations:
+                if is_invalid_tx(station):
+                    invalid_stations.append({
+                        "mac": station.get("mac"),
+                        "name": station.get("name"),
+                        "lastip": station.get("lastip"),
+                        "tx": station.get("tx"),
+                        "rx": station.get("rx"),
+                        "signal": station.get("signal"),
+                        "ccq": station.get("ccq"),
+                    })
+
+            invalid_count = len(invalid_stations)
+            invalid_percent = round((invalid_count / total) * 100, 2) if total else 0
+
+            should_reboot = total > 0 and invalid_percent >= 80
+
+            return Response({
+                "ok": True,
+                "ip": ip,
+                "endpoint": "sta.cgi",
+                "total_stations": total,
+                "invalid_tx_count": invalid_count,
+                "invalid_tx_percent": invalid_percent,
+                "threshold_percent": 80,
+                "should_reboot": should_reboot,
+                "invalid_stations": invalid_stations,
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                "ok": False,
+                "ip": ip,
+                "stage": "error",
+                "detail": str(e),
+            }, status=status.HTTP_200_OK)

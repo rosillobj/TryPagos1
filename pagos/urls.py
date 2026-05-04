@@ -16,5 +16,5 @@ urlpatterns = [
     path("antenaMikrotikData/<int:pk>/",views.MikrotikStatusView.as_view(),name='antenaMikrotikData'),
     path("lastPayment/<int:pk>/",views.LastPayment.as_view(),name='ultimoPago'),
     path("editInfoAntena/<int:pk>/",views.EditAntenaView.as_view(),name="EditarAntena"),
-    
+    path("sector/<int:pk>/tx-health/",views.SectorTxHealthView.as_view(), name ="AutoReboot"),   
 ]

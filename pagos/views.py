@@ -1247,30 +1247,54 @@ class SectorTxHealthView(APIView):
                     "preview": r.text[:300],
                 }, status=status.HTTP_200_OK)
 
-            def is_invalid_tx(station):
-                tx = station.get("tx")
+            def is_invalid_airmax_signal(station):
+                airmax = station.get("airmax") or {}
 
-                if tx in (None, "", "-"):
-                    return True
+                airmax_signal = airmax.get("signal")
+                airmax_quality = airmax.get("quality")
+                airmax_capacity = airmax.get("capacity")
 
                 try:
-                    return float(tx) < 1
+                    signal_invalid = float(airmax_signal) == 0
                 except (TypeError, ValueError):
-                    return True
+                    signal_invalid = True
+
+                try:
+                    quality_invalid = float(airmax_quality) == 0
+                except (TypeError, ValueError):
+                    quality_invalid = True
+
+                try:
+                    capacity_invalid = float(airmax_capacity) == 0
+                except (TypeError, ValueError):
+                    capacity_invalid = True
+
+                return signal_invalid or quality_invalid or capacity_invalid
 
             total = len(stations)
             invalid_stations = []
 
             for station in stations:
-                if is_invalid_tx(station):
+                airmax = station.get("airmax") or {}
+
+                if is_invalid_airmax_signal(station):
                     invalid_stations.append({
                         "mac": station.get("mac"),
                         "name": station.get("name"),
                         "lastip": station.get("lastip"),
-                        "tx": station.get("tx"),
-                        "rx": station.get("rx"),
+
+                        # Velocidad TX/RX Mbps
+                        "tx_rate": station.get("tx"),
+                        "rx_rate": station.get("rx"),
+
+                        # Señal general del AP
                         "signal": station.get("signal"),
                         "ccq": station.get("ccq"),
+
+                        # Datos clave para detectar TX Signal = "-"
+                        "airmax_signal": airmax.get("signal"),
+                        "airmax_quality": airmax.get("quality"),
+                        "airmax_capacity": airmax.get("capacity"),
                     })
 
             invalid_count = len(invalid_stations)
@@ -1283,10 +1307,19 @@ class SectorTxHealthView(APIView):
                 "ip": ip,
                 "endpoint": "sta.cgi",
                 "total_stations": total,
-                "invalid_tx_count": invalid_count,
-                "invalid_tx_percent": invalid_percent,
+
+                "invalid_airmax_count": invalid_count,
+                "invalid_airmax_percent": invalid_percent,
                 "threshold_percent": 80,
                 "should_reboot": should_reboot,
+
+                "criteria": {
+                    "airmax_signal": "0, null o inválido",
+                    "airmax_quality": "0, null o inválido",
+                    "airmax_capacity": "0, null o inválido",
+                    "logic": "si cualquiera de los 3 es inválido, la estación cuenta como falla",
+                },
+
                 "invalid_stations": invalid_stations,
             }, status=status.HTTP_200_OK)
 
